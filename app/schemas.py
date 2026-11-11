@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictInt,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
+
+# 版本号统一类型：非空白、长度 1..128 的字符串。
+VersionStr = Annotated[
+    str,
+    StringConstraints(strip_whitespace=False, min_length=1, max_length=128),
+]
 
 # 示例数据（行列序号均从 0 开始，与请求中的矩阵下标一致）---------------
 
@@ -187,3 +200,192 @@ class ConflictResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     service: str
+
+
+# ---------------------------------------------------------------------------
+# 版本登记 / 撤回：端到端 Swagger 样例
+# 版本号在各端点之间保持一致，可在 Swagger UI 中按顺序试跑完整流程：
+# 登记底表 -> 登记月报 -> 运行核查 -> 撤回底表 -> 确认级联停用。
+# ---------------------------------------------------------------------------
+
+EX_BASE_VERSION = "BASE-2026-11-A"
+EX_REPORT_VERSION = "RPT-2026-11-001"
+EX_CONFLICT_REPORT_VERSION = "RPT-2026-11-002"
+EX_BASE_NOTE = "2026 年 11 月院区 A 病例底表快照"
+
+EX_BASE_REGISTER: dict = {
+    "version": EX_BASE_VERSION,
+    "note": EX_BASE_NOTE,
+}
+
+EX_REPORT_REGISTER: dict = {
+    "version": EX_REPORT_VERSION,
+    "base_version": EX_BASE_VERSION,
+    **EX_RANGE,
+}
+
+# 使用无解矩阵的月报，核查时会得到 409（约束无解，不登记核查结果）。
+EX_REPORT_REGISTER_CONFLICT: dict = {
+    "version": EX_CONFLICT_REPORT_VERSION,
+    "base_version": EX_BASE_VERSION,
+    **EX_HALL_CONFLICT,
+}
+
+EX_WITHDRAW_BODY: dict = {
+    "reason": "院区 A 底表核对发现漏数，停用全部待发布产物",
+}
+
+
+# ---------------------------------------------------------------------------
+# 底表版本
+# ---------------------------------------------------------------------------
+
+
+class BaseRegisterRequest(BaseModel):
+    """登记底表版本请求。"""
+
+    version: VersionStr = Field(..., description="底表版本号，全局唯一，登记后不得覆盖")
+    note: str | None = Field(default=None, description="备注（如院区、快照日期、来源）")
+
+    @field_validator("version")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("版本号不能为空白字符串")
+        return value
+
+
+class BaseVersionRecord(BaseModel):
+    version: str
+    note: str | None = None
+    valid: bool = Field(..., description="true=有效；false=已撤回失效")
+    created_at: str
+    invalidated_at: str | None = None
+    invalidate_reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 月报版本
+# ---------------------------------------------------------------------------
+
+
+class ReportRegisterRequest(SuppressionRequest):
+    """登记月报请求：遮盖矩阵 + 公开合计 + 实际使用的底表版本。"""
+
+    version: VersionStr = Field(..., description="月报版本号，全局唯一，登记后不得覆盖")
+    base_version: VersionStr = Field(
+        ..., description="本月报实际使用的底表版本，必须已登记且有效"
+    )
+
+    @field_validator("version", "base_version")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("版本号不能为空白字符串")
+        return value
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"summary": "可行月报（3x3，6 个遮盖格）", "value": EX_REPORT_REGISTER},
+                {
+                    "summary": "无解月报（Hall 条件破坏，核查将返回 409）",
+                    "value": EX_REPORT_REGISTER_CONFLICT,
+                },
+            ]
+        }
+    }
+
+
+class ReportVersionRecord(BaseModel):
+    version: str
+    base_version: str
+    matrix: list[list[StrictInt | None]]
+    row_totals: list[StrictInt]
+    col_totals: list[StrictInt]
+    valid: bool = Field(..., description="true=有效；false=因底表撤回而级联失效")
+    created_at: str
+    invalidated_at: str | None = None
+    invalidate_reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 核查结果
+# ---------------------------------------------------------------------------
+
+
+class CheckResultContent(FeasibleResponse):
+    """登记入库的核查结果内容（现有 solver.analyze 的有解输出）。"""
+
+
+class CheckRecord(BaseModel):
+    version: str = Field(..., description="核查结果版本号，全局递增，如 CHK-000001")
+    report_version: str
+    base_version: str
+    result: CheckResultContent
+    valid: bool = Field(..., description="true=有效；false=随底表撤回而失效")
+    created_at: str
+    invalidated_at: str | None = None
+    invalidate_reason: str | None = None
+
+
+class CheckCreatedResponse(BaseModel):
+    """有解核查的登记响应：核查版本及其完整结果。"""
+
+    check_version: str
+    report_version: str
+    base_version: str
+    valid: Literal[True]
+    created_at: str
+    result: CheckResultContent
+
+
+# ---------------------------------------------------------------------------
+# 撤回
+# ---------------------------------------------------------------------------
+
+
+class WithdrawRequest(BaseModel):
+    reason: str | None = Field(
+        default=None, description="撤回原因；留空时记录为“人工撤回”"
+    )
+
+
+class WithdrawResponse(BaseModel):
+    base_version: str
+    already_withdrawn: bool = Field(
+        ..., description="true=该底表此前已撤回（幂等返回，停用列表为空）"
+    )
+    decommissioned_reports: list[str] = Field(
+        ..., description="本次必须停用的月报版本（撤回前仍有效的依赖月报）"
+    )
+    decommissioned_checks: list[str] = Field(
+        ..., description="本次必须停用的核查结果版本（撤回前仍有效的依赖核查）"
+    )
+    invalidated_at: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 统一错误信封
+# ---------------------------------------------------------------------------
+
+
+class ErrorResponse(BaseModel):
+    error: "ErrorDetail"
+
+
+class ErrorDetail(BaseModel):
+    code: str = Field(..., description="稳定错误码，如 BASE_VERSION_NOT_FOUND")
+    message: str
+    detail: dict | None = None
+
+
+ErrorResponse.model_rebuild()
+
+
+class CheckConflictResponse(BaseModel):
+    """月报核查无解（409）：沿用 solver 的冲突结构，不登记任何核查结果。"""
+
+    status: Literal["conflict"]
+    reasons: list[str]
+    witness: ConflictWitness | None = None

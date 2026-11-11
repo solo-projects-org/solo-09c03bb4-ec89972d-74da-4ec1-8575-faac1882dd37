@@ -1,8 +1,13 @@
 services:
   suppression-check:
     build: .
-    image: suppression-check:1.0.0
+    image: suppression-check:2.0.0
     container_name: suppression-check
+    environment:
+      # SQLite 登记库位置；挂载到命名卷以持久化底表/月报/核查版本
+      SUPPRESSION_DB_PATH: /data/suppression.db
+    volumes:
+      - suppression-data:/data
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -16,3 +21,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  suppression-data:

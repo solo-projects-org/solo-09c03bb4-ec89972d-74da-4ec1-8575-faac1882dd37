@@ -13,10 +13,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 以非 root 用户运行
+# 以非 root 用户运行；预建 SQLite 数据目录并交给运行用户
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data \
+    && chown -R appuser:appuser /app /data
 USER appuser
+
+ENV SUPPRESSION_DB_PATH=/data/suppression.db
 
 EXPOSE 8000
 
